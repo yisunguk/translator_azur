@@ -9,6 +9,8 @@ from azure.core.credentials import AzureKeyCredential
 import urllib.parse
 
 import requests
+import json
+from pathlib import Path
 
 # -----------------------------
 # 설정 및 비밀 관리
@@ -83,7 +85,34 @@ def generate_sas_url(blob_service_client, container_name, blob_name=None, permis
     else:
         # 컨테이너 루트 URL
         return f"{base_url}?{sas_token}"
+# -----------------------------
+# 작업 상태 관리 (Local JSON)
+# -----------------------------
+JOBS_FILE = "jobs.json"
 
+def load_jobs():
+    if os.path.exists(JOBS_FILE):
+        try:
+            with open(JOBS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_job(job_id, job_data):
+    jobs = load_jobs()
+    jobs[job_id] = job_data
+    with open(JOBS_FILE, "w", encoding="utf-8") as f:
+        json.dump(jobs, f, ensure_ascii=False, indent=2)
+
+def update_job_status(job_id, status):
+    jobs = load_jobs()
+    if job_id in jobs:
+        jobs[job_id]["status"] = status
+        with open(JOBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(jobs, f, ensure_ascii=False, indent=2)
+
+# -----------------------------
 # -----------------------------
 # UI 구성
 # -----------------------------
@@ -124,7 +153,7 @@ LANG_SUFFIX_OVERRIDE = {
 
 with st.sidebar:
     st.header("메뉴")
-    menu = st.radio("이동", ["번역하기", "파일 보관함"])
+    menu = st.radio("이동", ["번역하기", "작업 상태", "파일 보관함"])
     
     st.divider()
     
@@ -199,6 +228,7 @@ if menu == "번역하기":
                 try:
                     client = get_translation_client()
                     
+
                     poller = client.begin_translation(
                         inputs=[
                             DocumentTranslationInput(
@@ -214,119 +244,153 @@ if menu == "번역하기":
                         ]
                     )
                     
-                    result = poller.result()
+                    job_id = poller.id
                     
-                    for doc in result:
-                        if doc.status == "Succeeded":
-                            st.success(f"번역 완료! (상태: {doc.status})")
-                        else:
-                            st.error(f"문서 번역 실패! (상태: {doc.status})")
-                            if doc.error:
-                                st.error(f"에러 코드: {doc.error.code}, 메시지: {doc.error.message}")
+                    # Save Job Info locally
+                    job_data = {
+                        "filename": original_filename,
+                        "file_uuid": file_uuid,
+                        "target_lang_code": target_lang_code,
+                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "status": "Running" 
+                    }
+                    save_job(job_id, job_data)
                     
-                    # 결과 파일 찾기
-                    time.sleep(2)
-                    output_prefix_search = f"output/{file_uuid}"
-                    output_blobs = list(container_client.list_blobs(name_starts_with=output_prefix_search))
+                    st.success(f"번역 작업이 시작되었습니다! (Job ID: {job_id})")
+                    st.info("좌측 메뉴의 '작업 상태'에서 진행 상황을 확인하고 결과를 다운로드하세요.")
                     
-                    if not output_blobs:
-                        all_output = list(container_client.list_blobs(name_starts_with="output/"))
-                        debug_msg = "\n".join([b.name for b in all_output[:10]])
-                        st.error(f"결과 파일을 찾을 수 없습니다. (검색 경로: {output_prefix_search})\n현재 output 폴더 파일 목록:\n{debug_msg}")
-                    else:
-                        st.subheader("다운로드")
-                        for blob in output_blobs:
-                            blob_name = blob.name
-                            file_name = blob_name.split("/")[-1]
-                            
-                            # 파일명에 언어 접미사 추가 (Rename)
-                            suffix = LANG_SUFFIX_OVERRIDE.get(target_lang_code, target_lang_code.upper())
-                            name_part, ext_part = os.path.splitext(file_name)
-                            
-                            # 이미 접미사가 있는지 확인 (혹시 모를 중복 방지)
-                            if not name_part.endswith(f"_{suffix}"):
-                                new_file_name = f"{name_part}_{suffix}{ext_part}"
-                                new_blob_name = f"output/{file_uuid}/{new_file_name}"
-                                
-                                try:
-                                    # Rename: Copy to new name -> Delete old
-                                    source_blob = container_client.get_blob_client(blob_name)
-                                    dest_blob = container_client.get_blob_client(new_blob_name)
-                                    
-                                    source_sas = generate_sas_url(blob_service_client, CONTAINER_NAME, blob_name)
-                                    dest_blob.start_copy_from_url(source_sas)
-                                    
-                                    # Wait for copy
-                                    for _ in range(10):
-                                        props = dest_blob.get_blob_properties()
-                                        if props.copy.status == "success":
-                                            break
-                                        time.sleep(0.2)
-                                        
-                                    source_blob.delete_blob()
-                                    
-                                    # Update variables for download link
-                                    blob_name = new_blob_name
-                                    file_name = new_file_name
-                                    st.toast(f"파일명 변경됨: {file_name}")
-                                    
-                                except Exception as e:
-                                    st.warning(f"파일명 변경 실패 (기본 이름으로 유지): {e}")
-
-                            # PPTX 폰트 변경 (Times New Roman)
-                            if file_name.lower().endswith(".pptx"):
-                                try:
-                                    from pptx import Presentation
-                                    
-                                    # 임시 파일로 다운로드
-                                    temp_pptx = f"temp_{file_uuid}.pptx"
-                                    blob_client_temp = container_client.get_blob_client(blob_name)
-                                    with open(temp_pptx, "wb") as f:
-                                        data = blob_client_temp.download_blob().readall()
-                                        f.write(data)
-                                    
-                                    # 폰트 변경 로직
-                                    prs = Presentation(temp_pptx)
-                                    font_name = "Times New Roman"
-                                    
-                                    def change_font(shapes):
-                                        for shape in shapes:
-                                            if shape.has_text_frame:
-                                                for paragraph in shape.text_frame.paragraphs:
-                                                    for run in paragraph.runs:
-                                                        run.font.name = font_name
-                                            
-                                            if shape.has_table:
-                                                for row in shape.table.rows:
-                                                    for cell in row.cells:
-                                                        if cell.text_frame:
-                                                            for paragraph in cell.text_frame.paragraphs:
-                                                                for run in paragraph.runs:
-                                                                    run.font.name = font_name
-                                            
-                                            if shape.shape_type == 6: # Group
-                                                change_font(shape.shapes)
-
-                                    for slide in prs.slides:
-                                        change_font(slide.shapes)
-                                    
-                                    prs.save(temp_pptx)
-                                    
-                                    # 다시 업로드 (덮어쓰기)
-                                    with open(temp_pptx, "rb") as f:
-                                        blob_client_temp.upload_blob(f, overwrite=True)
-                                    
-                                    os.remove(temp_pptx)
-                                    st.toast("PPTX 폰트 변경 완료 (Times New Roman)")
-                                    
-                                except Exception as e:
-                                    st.warning(f"PPTX 폰트 변경 실패: {e}")
-
-                            download_sas = generate_sas_url(blob_service_client, CONTAINER_NAME, blob_name)
-                            st.markdown(f"[{file_name} 다운로드]({download_sas})", unsafe_allow_html=True)
-                            
                 except Exception as e:
                     st.error(f"번역 요청 중 오류 발생: {e}")
+
+elif menu == "작업 상태":
+    st.subheader("⏳ 번역 작업 상태")
+    
+    jobs = load_jobs()
+    if not jobs:
+        st.info("기록된 작업이 없습니다.")
+    else:
+        # Sort by date desc
+        sorted_job_ids = sorted(jobs.keys(), key=lambda x: jobs[x].get('created_at', ''), reverse=True)
+        
+        client = get_translation_client()
+        blob_service_client = get_blob_service_client()
+        container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+
+        for job_id in sorted_job_ids:
+            job = jobs[job_id]
+            
+            with st.expander(f"{job.get('created_at')} - {job.get('filename')} ({job.get('status')})", expanded=True):
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.write(f"**Job ID:** `{job_id}`")
+                    st.write(f"**Target Lang:** {job.get('target_lang_code')}")
+                
+                with col2:
+                    # Check Status Button
+                    if st.button("상태 확인", key=f"check_{job_id}"):
+                        try:
+                            status_obj = client.get_translation_status(job_id)
+                            new_status = status_obj.status
+                            update_job_status(job_id, new_status)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"상태 확인 실패: {e}")
+
+                # If Succeeded, Show Finalize/Download
+                if job.get("status") == "Succeeded":
+                    if st.button("결과 처리 및 다운로드", key=f"finalize_{job_id}", type="primary"):
+                        with st.spinner("결과 파일 처리 중..."):
+                            try:
+                                file_uuid = job.get("file_uuid")
+                                target_lang_code = job.get("target_lang_code")
+                                
+                                # 결과 파일 찾기
+                                output_prefix_search = f"output/{file_uuid}"
+                                output_blobs = list(container_client.list_blobs(name_starts_with=output_prefix_search))
+                                
+                                if not output_blobs:
+                                    st.error("결과 파일을 찾을 수 없습니다.")
+                                else:
+                                    download_links = []
+                                    for blob in output_blobs:
+                                        blob_name = blob.name
+                                        file_name = blob_name.split("/")[-1]
+                                        
+                                        # Rename Logic
+                                        suffix = LANG_SUFFIX_OVERRIDE.get(target_lang_code, target_lang_code.upper())
+                                        name_part, ext_part = os.path.splitext(file_name)
+                                        
+                                        final_blob_name = blob_name
+                                        final_file_name = file_name
+                                        
+                                        if not name_part.endswith(f"_{suffix}"):
+                                            new_file_name = f"{name_part}_{suffix}{ext_part}"
+                                            new_blob_name = f"output/{file_uuid}/{new_file_name}"
+                                            
+                                            try:
+                                                source_blob = container_client.get_blob_client(blob_name)
+                                                dest_blob = container_client.get_blob_client(new_blob_name)
+                                                source_sas = generate_sas_url(blob_service_client, CONTAINER_NAME, blob_name)
+                                                dest_blob.start_copy_from_url(source_sas)
+                                                
+                                                for _ in range(10):
+                                                    props = dest_blob.get_blob_properties()
+                                                    if props.copy.status == "success":
+                                                        break
+                                                    time.sleep(0.2)
+                                                
+                                                source_blob.delete_blob()
+                                                final_blob_name = new_blob_name
+                                                final_file_name = new_file_name
+                                            except Exception as e:
+                                                st.warning(f"Rename failed: {e}")
+
+                                        # PPTX Font Fix
+                                        if final_file_name.lower().endswith(".pptx"):
+                                            try:
+                                                from pptx import Presentation
+                                                temp_pptx = f"temp_{file_uuid}.pptx"
+                                                blob_client_temp = container_client.get_blob_client(final_blob_name)
+                                                with open(temp_pptx, "wb") as f:
+                                                    f.write(blob_client_temp.download_blob().readall())
+                                                
+                                                prs = Presentation(temp_pptx)
+                                                font_name = "Times New Roman"
+                                                def change_font(shapes):
+                                                    for shape in shapes:
+                                                        if shape.has_text_frame:
+                                                            for p in shape.text_frame.paragraphs:
+                                                                for r in p.runs: r.font.name = font_name
+                                                        if shape.has_table:
+                                                            for r in shape.table.rows:
+                                                                for c in r.cells:
+                                                                    if c.text_frame:
+                                                                        for p in c.text_frame.paragraphs:
+                                                                            for run in p.runs: run.font.name = font_name
+                                                        if shape.shape_type == 6: change_font(shape.shapes)
+                                                
+                                                for slide in prs.slides: change_font(slide.shapes)
+                                                prs.save(temp_pptx)
+                                                
+                                                with open(temp_pptx, "rb") as f:
+                                                    blob_client_temp.upload_blob(f, overwrite=True)
+                                                os.remove(temp_pptx)
+                                                st.toast("PPTX Font Fixed")
+                                            except Exception as e:
+                                                st.warning(f"PPTX Font Fix Failed: {e}")
+
+                                        # Generate Download Link
+                                        sas = generate_sas_url(blob_service_client, CONTAINER_NAME, final_blob_name)
+                                        download_links.append(f"[{final_file_name} 다운로드]({sas})")
+                                    
+                                    for link in download_links:
+                                        st.markdown(link, unsafe_allow_html=True)
+
+                            except Exception as e:
+                                st.error(f"처리 중 오류: {e}")
+                            
+
 
 elif menu == "파일 보관함":
     st.subheader("📂 클라우드 파일 보관함")
