@@ -1,0 +1,9 @@
+streamlit
+azure-storage-blob
+azure-ai-translation-document
+azure-core
+requests
+pymupdf
+pandas
+python-pptx
+extra-streamlit-components
