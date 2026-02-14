@@ -362,6 +362,11 @@ if uploaded_files:
         if 'current_batch_id' not in st.session_state:
             st.session_state.current_batch_id = str(uuid.uuid4())
             
+        # Extract language names for display
+        lang_names = [label.split(' (')[0] for label in target_lang_labels]
+        lang_msg = ", ".join(lang_names)
+        st.info(f"❓ **{lang_msg}**(으)로 번역하시겠습니까?")
+
         col1, col2 = st.columns([1, 1])
         with col1:
              start_btn = st.button("번역 시작", type="primary", use_container_width=True)
