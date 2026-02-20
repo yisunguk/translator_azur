@@ -1,0 +1,437 @@
+import os
+import re
+import io
+import zipfile
+import tempfile
+import pathlib
+import streamlit as st
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from fpdf import FPDF
+
+# DeepL 불러오기
+try:
+    import deepl
+except Exception:
+    st.error("`deepl` 패키지가 설치되어 있지 않습니다. 터미널에서 `pip install deepl` 실행 후 다시 시도하세요.")
+    st.stop()
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    st.error("`PyMuPDF` 패키지가 설치되어 있지 않습니다. 터미널에서 `pip install pymupdf` 실행 후 다시 시도하세요.")
+    st.stop()
+
+# 원격 폰트 다운로드용
+try:
+    import requests
+except Exception:
+    st.error("`requests` 패키지가 필요합니다. 터미널에서 `pip install requests` 실행 후 다시 시도하세요.")
+    st.stop()
+
+SUPPORTED_EXTS = {".pptx", ".pdf"}  # Free 요금제: PPTX + PDF 지원
+
+# -----------------------------
+# 세션 상태 초기화
+# -----------------------------
+if "dl_results" not in st.session_state:
+    st.session_state["dl_results"] = []   # [{label, code, path}]
+if "work_ext" not in st.session_state:
+    st.session_state["work_ext"] = None   # ".pptx" | ".pdf"
+if "work_name" not in st.session_state:
+    st.session_state["work_name"] = ""    # 업로드 원본 파일명
+if "saved_inputs" not in st.session_state:
+    st.session_state["saved_inputs"] = {} # 업로드 비교용
+
+# -----------------------------
+# 유틸
+# -----------------------------
+def get_deepl_key():
+    key_from_input = st.session_state.get("user_api_key")
+    if key_from_input:
+        return key_from_input
+    return os.environ.get("DEEPL_API_KEY")
+
+def save_uploaded_file(uploaded_file) -> pathlib.Path:
+    suffix = pathlib.Path(uploaded_file.name).suffix.lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.read())
+        return pathlib.Path(tmp.name)
+
+def output_path_for(input_path: pathlib.Path, target_lang_code: str, new_ext: str | None = None) -> pathlib.Path:
+    suffix = new_ext if new_ext else input_path.suffix
+    return input_path.with_name(f"{input_path.stem}.translated_{target_lang_code}{suffix}")
+
+def clear_results():
+    # 임시 결과 파일 삭제
+    for item in st.session_state["dl_results"]:
+        try:
+            pathlib.Path(item["path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+    st.session_state["dl_results"] = []
+    st.session_state["work_ext"] = None
+    st.session_state["work_name"] = ""
+
+def safe_rerun():
+    # Streamlit 버전 호환
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+
+# -----------------------------
+# 플래그 이모지 & 국가코드 매핑
+# -----------------------------
+FLAG_EMOJI = {
+    "AR": "🇸🇦", "BG": "🇧🇬", "CS": "🇨🇿", "DA": "🇩🇰", "DE": "🇩🇪", "EL": "🇬🇷",
+    "EN": "🇬🇧", "EN-GB": "🇬🇧", "EN-US": "🇺🇸", "ES": "🇪🇸", "ES-419": "🇲🇽",
+    "ET": "🇪🇪", "FI": "🇫🇮", "FR": "🇫🇷", "HE": "🇮🇱", "HU": "🇭🇺", "ID": "🇮🇩",
+    "IT": "🇮🇹", "JA": "🇯🇵", "KO": "🇰🇷", "LT": "🇱🇹", "LV": "🇱🇻", "NB": "🇳🇴",
+    "NL": "🇳🇱", "PL": "🇵🇱", "PT": "🇵🇹", "PT-BR": "🇧🇷", "PT-PT": "🇵🇹",
+    "RO": "🇷🇴", "RU": "🇷🇺", "SK": "🇸🇰", "SL": "🇸🇮", "SV": "🇸🇪", "TH": "🇹🇭",
+    "TR": "🇹🇷", "UK": "🇺🇦", "VI": "🇻🇳", "ZH": "🇨🇳", "ZH-HANS": "🇨🇳", "ZH-HANT": "🇹🇼"
+}
+LANG_TO_CC = {
+    "AR": "SA", "BG": "BG", "CS": "CZ", "DA": "DK", "DE": "DE", "EL": "GR",
+    "EN": "GB", "EN-GB": "GB", "EN-US": "US", "ES": "ES", "ES-419": "MX",
+    "ET": "EE", "FI": "FI", "FR": "FR", "HE": "IL", "HU": "HU", "ID": "ID",
+    "IT": "IT", "JA": "JP", "KO": "KR", "LT": "LT", "LV": "LV", "NB": "NO",
+    "NL": "NL", "PL": "PL", "PT": "PT", "PT-BR": "BR", "PT-PT": "PT",
+    "RO": "RO", "RU": "RU", "SK": "SK", "SL": "SI", "SV": "SE", "TH": "TH",
+    "TR": "TR", "UK": "UA", "VI": "VN", "ZH": "CN", "ZH-HANS": "CN", "ZH-HANT": "TW"
+}
+def build_label(name: str, code: str) -> str:
+    code_up = code.upper()
+    flag = FLAG_EMOJI.get(code_up, "🌐")
+    cc = LANG_TO_CC.get(code_up, code_up.split("-")[0])
+    return f"{flag} [{cc}] {name} – {code_up}"
+
+# -----------------------------
+# DeepL 타겟 언어 동적 로드 (+ next-gen only 보강)
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def fetch_target_languages(auth_key: str):
+    translator = deepl.Translator(auth_key)
+    langs = translator.get_target_languages()  # list[Language]
+    pairs = {l.code.upper(): build_label(l.name, l.code) for l in langs}
+    # 문서 공지 기준: /languages에 없을 수 있는 next-gen 전용 타겟 언어 보강
+    NEXT_GEN_ONLY = [
+        ("HE", "Hebrew (next-gen only)"),
+        ("TH", "Thai (next-gen only)"),
+        ("VI", "Vietnamese (next-gen only)"),
+        ("ES-419", "Spanish (Latin American, next-gen only)"),
+    ]
+    for code, name in NEXT_GEN_ONLY:
+        pairs.setdefault(code, build_label(name, code))
+    return sorted([(label, code) for code, label in pairs.items()], key=lambda x: x[0].lower())
+
+# -----------------------------
+# PPTX 번역 (원본 유지)
+# -----------------------------
+def translate_pptx_text(input_fp: pathlib.Path, output_fp: pathlib.Path, target_lang: str, translator: "deepl.Translator"):
+    prs = Presentation(str(input_fp))
+    num_prefix_re = re.compile(r'^\s*(\d+[\.\)]\s*)')
+
+    def translate_batch(texts: list[str]) -> list[str]:
+        if not texts:
+            return []
+        res = translator.translate_text(
+            texts,
+            target_lang=target_lang,
+            preserve_formatting=True,
+            split_sentences="nonewlines",
+        )
+        if isinstance(res, list):
+            return [r.text for r in res]
+        return [res.text]
+
+    def iter_shapes(shapes):
+        for shp in shapes:
+            yield shp
+            if shp.shape_type == MSO_SHAPE_TYPE.GROUP:
+                yield from iter_shapes(shp.shapes)
+
+    for slide in prs.slides:
+        for shp in iter_shapes(slide.shapes):
+            if shp.has_text_frame:
+                paras = shp.text_frame.paragraphs
+                items = []
+                for p in paras:
+                    raw = p.text
+                    if raw and raw.strip():
+                        m = num_prefix_re.match(raw)
+                        prefix = m.group(0) if m else ""
+                        core = raw[m.end():] if m else raw
+                        items.append((p, prefix, core))
+
+                translated = translate_batch([core for (_, _, core) in items])
+                for (p, prefix, _), new_text in zip(items, translated):
+                    if not p.runs:
+                        continue
+                    p.runs[0].text = prefix + new_text
+                    for run in p.runs[1:]:
+                        run.text = ""
+
+            if shp.shape_type == MSO_SHAPE_TYPE.TABLE:
+                for row in shp.table.rows:
+                    for cell in row.cells:
+                        paras = cell.text_frame.paragraphs
+                        items = []
+                        for p in paras:
+                            raw = p.text
+                            if raw and raw.strip():
+                                m = num_prefix_re.match(raw)
+                                prefix = m.group(0) if m else ""
+                                core = raw[m.end():] if m else raw
+                                items.append((p, prefix, core))
+
+                        translated = translate_batch([core for (_, _, core) in items])
+                        for (p, prefix, _), new_text in zip(items, translated):
+                            if not p.runs:
+                                continue
+                            p.runs[0].text = prefix + new_text
+                            for run in p.runs[1:]:
+                                run.text = ""
+
+    prs.save(str(output_fp))
+
+# -----------------------------
+# (교체됨) PDF 번역 — 유니코드 폰트 자동 다운로드 + 적용
+# -----------------------------
+# 원격 폰트 URL (공식 Noto 저장소)
+FONT_URLS = {
+    "NotoSans":     "https://raw.githubusercontent.com/notofonts/noto-fonts/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
+    "NotoSansThai": "https://raw.githubusercontent.com/notofonts/noto-fonts/main/hinted/ttf/NotoSansThai/NotoSansThai-Regular.ttf",
+}
+
+FONT_CACHE_DIR = pathlib.Path(tempfile.gettempdir()) / "translator_font_cache"
+FONT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+@st.cache_resource(show_spinner=False)
+def ensure_font_local(name: str) -> pathlib.Path:
+    """지정한 폰트를 OS 임시 캐시에 보관하고 경로를 반환"""
+    url = FONT_URLS.get(name)
+    if not url:
+        raise ValueError(f"Unknown font key: {name}")
+    ext = ".ttf" if url.lower().endswith(".ttf") else ".otf"
+    dest = FONT_CACHE_DIR / f"{name}{ext}"
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    dest.write_bytes(resp.content)
+    if dest.stat().st_size < 10_000:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"Font download failed (too small): {name}")
+    return dest
+
+def translate_pdf_text(input_fp: pathlib.Path, output_fp: pathlib.Path, target_lang: str, translator: "deepl.Translator"):
+    doc = fitz.open(str(input_fp))
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # 1) 필요한 폰트 확보 & 등록 (라틴/베트남어 등: NotoSans, 태국어: NotoSansThai)
+    try:
+        path_sans = ensure_font_local("NotoSans")
+        pdf.add_font("NotoSans", "", str(path_sans), uni=True)
+    except Exception as e:
+        st.error(f"기본 폰트 다운로드/등록 실패: {e}")
+        return
+
+    path_thai = None
+    try:
+        path_thai = ensure_font_local("NotoSansThai")
+        pdf.add_font("NotoThai", "", str(path_thai), uni=True)
+    except Exception:
+        # 태국어가 아니면 없어도 진행 가능
+        path_thai = None
+
+    # 2) 간단한 스크립트 감지로 폰트 선택
+    re_th = re.compile(r"[\u0E00-\u0E7F]")  # Thai block
+
+    def pick_font(s: str) -> str:
+        if path_thai and re_th.search(s):
+            return "NotoThai"
+        return "NotoSans"
+
+    # 3) 페이지별 번역 및 출력
+    for page in doc:
+        src_text = page.get_text("text") or ""
+        try:
+            tr_text = translator.translate_text(src_text, target_lang=target_lang).text if src_text.strip() else "[빈 페이지]"
+        except Exception as e:
+            tr_text = f"[번역 실패] {e}"
+
+        pdf.add_page()
+        pdf.set_font(pick_font(tr_text), size=12)
+        # fpdf2는 유니코드 출력 가능. latin-1 에러 방지됨.
+        pdf.multi_cell(0, 8, tr_text)
+
+    pdf.output(str(output_fp))
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="외국인 근로자 교재 번역기", page_icon="🌏", layout="centered")
+
+# 이모지 폰트 우선 적용
+st.markdown("""
+<style>
+html, body, [class^="css"]  {
+  font-family: system-ui, -apple-system, "Segoe UI", "Apple Color Emoji", "Segoe UI Emoji",
+               "Noto Color Emoji", "Helvetica", "Arial", sans-serif !important;
+}
+.stMultiSelect, .stSelectbox, .stTextInput {
+  font-family: system-ui, -apple-system, "Segoe UI", "Apple Color Emoji", "Segoe UI Emoji",
+               "Noto Color Emoji", "Helvetica", "Arial", sans-serif !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🌏 외국인 근로자 교재 번역기")
+st.caption("DeepL API 기반 PPTX/PDF 번역 — 여러 언어 동시 번역, 국기 아이콘 포함")
+
+with st.sidebar:
+    st.header("설정")
+    st.text_input(
+        "DeepL API 키",
+        value=os.environ.get("DEEPL_API_KEY", ""),
+        type="password",
+        key="user_api_key",
+        help="키를 입력하면 지원 언어를 자동으로 불러옵니다."
+    )
+
+    if st.button("언어 목록 새로고침", help="캐시를 지우고 DeepL에서 다시 불러옵니다."):
+        st.cache_data.clear()
+
+    auth_key = get_deepl_key()
+    target_lang_pairs = []
+    if auth_key:
+        try:
+            target_lang_pairs = fetch_target_languages(auth_key)  # [(label, code)]
+        except Exception as e:
+            st.error(f"지원 언어 목록을 불러올 수 없습니다: {e}")
+
+    options = [label for (label, _) in target_lang_pairs]
+
+    # ✅ 기본 선택 제거: default=[]
+    tgt_labels = st.multiselect(
+        "목표 언어 선택 (여러 개 가능)",
+        options,
+        default=[],
+        placeholder="API 키 입력 후 선택하세요 (기본 선택 없음)",
+        help="플래그가 글자로 보일 경우에도 [CC]가 함께 표시됩니다."
+    )
+    target_langs = [code for (lbl, code) in target_lang_pairs if lbl in tgt_labels]
+
+# 업로드 위젯 (새 파일 선택 시 이전 결과 지움)
+uploaded = st.file_uploader(
+    "번역할 PPTX 또는 PDF 파일 업로드",
+    type=[ext[1:] for ext in SUPPORTED_EXTS],
+    accept_multiple_files=False,
+    help="Free 요금제는 PPTX + PDF만 지원합니다."
+)
+if uploaded:
+    # 새 파일로 바뀌었는지 체크
+    cur_name = uploaded.name
+    prev_name = st.session_state["saved_inputs"].get("uploaded_name")
+    if prev_name != cur_name:
+        clear_results()
+        st.session_state["saved_inputs"]["uploaded_name"] = cur_name
+
+start = st.button("번역 시작", type="primary", disabled=not uploaded or not target_langs or not get_deepl_key())
+
+# -----------------------------
+# 번역 실행 (결과는 세션에 저장)
+# -----------------------------
+if start and uploaded:
+    ext = pathlib.Path(uploaded.name).suffix.lower()
+    if ext not in SUPPORTED_EXTS:
+        st.error(f"지원하지 않는 확장자입니다: {ext}")
+        st.stop()
+
+    auth_key = get_deepl_key()
+    if not auth_key:
+        st.error("DeepL API 키가 필요합니다.")
+        st.stop()
+
+    with st.spinner("번역 중입니다..."):
+        in_path = save_uploaded_file(uploaded)
+        out_ext = ".pptx" if ext == ".pptx" else ".pdf"
+        translator = deepl.Translator(auth_key)
+
+        # 진행률 바
+        progress = st.progress(0.0)
+        total = max(len(target_langs), 1)
+
+        label_by_code = {code: lbl for (lbl, code) in target_lang_pairs}
+        made = []
+        try:
+            for i, lang_code in enumerate(target_langs, start=1):
+                out_path = output_path_for(in_path, lang_code, new_ext=out_ext)
+                if ext == ".pptx":
+                    translate_pptx_text(in_path, out_path, lang_code, translator)
+                else:
+                    translate_pdf_text(in_path, out_path, lang_code, translator)
+                made.append({"label": label_by_code.get(lang_code, lang_code),
+                             "code": lang_code, "path": str(out_path)})
+                progress.progress(i / total)
+            # 입력 임시 파일은 정리
+            try:
+                in_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            # ✅ 세션에 저장하여 리런 후에도 유지
+            st.session_state["dl_results"] = made
+            st.session_state["work_ext"] = out_ext
+            st.session_state["work_name"] = uploaded.name
+            st.success("✅ 번역 완료! 아래에서 파일을 다운로드하세요.")
+        except Exception as e:
+            st.error(f"번역 중 오류 발생: {e}")
+
+# -----------------------------
+# 결과 다운로드 영역 (세션 기반으로 항상 렌더)
+# -----------------------------
+if st.session_state["dl_results"]:
+    ext = st.session_state["work_ext"]
+    base = pathlib.Path(st.session_state["work_name"]).stem
+
+    # 개별 다운로드 버튼
+    for idx, item in enumerate(st.session_state["dl_results"]):
+        try:
+            with open(item["path"], "rb") as f:
+                mime = ("application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                        if ext == ".pptx" else "application/pdf")
+                st.download_button(
+                    label=f'{item["label"]} 번역본 다운로드',
+                    data=f.read(),
+                    file_name=pathlib.Path(item["path"]).name,
+                    mime=mime,
+                    key=f"dl-{idx}"  # 🔑 리런에도 고유 키 유지
+                )
+        except FileNotFoundError:
+            st.warning(f"파일이 사라졌습니다: {item['path']}")
+
+    # ZIP 다운로드 (2개 이상일 때)
+    if len(st.session_state["dl_results"]) > 1:
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in st.session_state["dl_results"]:
+                p = pathlib.Path(item["path"])
+                if p.exists():
+                    zf.write(p, arcname=p.name)
+        zip_buf.seek(0)
+        st.download_button(
+            label=f"모든 번역본 ZIP으로 다운로드 ({len(st.session_state['dl_results'])}개)",
+            data=zip_buf.read(),
+            file_name=f"{base}_translations.zip",
+            mime="application/zip",
+            key="zip-all"  # 🔑 고유 키
+        )
+
+    # 결과 지우기
+    if st.button("결과 지우기", key="clear-results", help="결과 버튼을 숨기고 임시 파일을 삭제합니다."):
+        clear_results()
+        safe_rerun()

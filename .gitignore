@@ -5,3 +5,6 @@ venv/
 .env
 .ipynb_checkpoints/
 .vscode/
+
+.venv
+firebase-debug.log

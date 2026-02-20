@@ -334,10 +334,19 @@ with st.sidebar:
     target_lang_labels = st.multiselect("목표 언어 선택 (복수 선택 가능)", lang_labels, default=[lang_labels[default_index]])
     target_lang_codes = [LANGUAGES[label] for label in target_lang_labels]
     
+    # Source Language Selector (Optional)
+    st.subheader("원본 언어 (선택 사항)")
+    source_lang_options = ["자동 감지"] + lang_labels
+    source_lang_label = st.selectbox("원본 문서의 언어", source_lang_options, index=0)
+    source_lang_code = None
+    if source_lang_label != "자동 감지":
+        source_lang_code = LANGUAGES[source_lang_label]
+
     if target_lang_codes:
-        st.info(f"선택된 언어: {', '.join(target_lang_codes)}")
+        target_lang_names_display = [label.split(' (')[0] for label in target_lang_labels]
+        st.info(f"선택된 목표 언어: {', '.join(target_lang_names_display)} | 원본 언어: {source_lang_label}")
     else:
-        st.warning("최소 하나 이상의 언어를 선택해주세요.")
+        st.warning("최소 하나 이상의 목표 언어를 선택해주세요.")
     
     st.divider()
 
@@ -456,6 +465,7 @@ if uploaded_files:
                                     inputs=[
                                         DocumentTranslationInput(
                                             source_url=source_url,
+                                            source_language=source_lang_code, # Explicit Source Language
                                             storage_type="File",
                                             targets=[
                                                 TranslationTarget(
